@@ -19,6 +19,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.junit.jupiter.engine.Constants;
 import org.junit.platform.engine.DiscoverySelector;
@@ -43,6 +44,32 @@ public class ActualRunner implements RunsTest {
       throw new UncheckedIOException(e);
     }
 
+    // Catches exceptions that escape uncaught on threads the test spawns but never joins/awaits
+    // (e.g. a raw `new Thread(...)` whose crash would otherwise vanish, since the test method
+    // itself returns normally and the engine never learns anything went wrong). This only helps
+    // for threads with no uncaught exception handler of their own: exceptions swallowed inside an
+    // ExecutorService/Future/CompletableFuture/coroutine that is never awaited, or a crash that
+    // happens strictly after this method has already decided pass/fail, are both invisible to
+    // this (or any other) listener-based mechanism.
+    AtomicReference<Throwable> uncaughtOnOtherThread = new AtomicReference<>();
+    Thread.UncaughtExceptionHandler previousHandler = Thread.getDefaultUncaughtExceptionHandler();
+    Thread.setDefaultUncaughtExceptionHandler(
+        (thread, throwable) -> {
+          uncaughtOnOtherThread.compareAndSet(null, throwable);
+          if (previousHandler != null) {
+            previousHandler.uncaughtException(thread, throwable);
+          }
+        });
+
+    try {
+      return runWithOutputListener(testClassName, xmlOut, uncaughtOnOtherThread);
+    } finally {
+      Thread.setDefaultUncaughtExceptionHandler(previousHandler);
+    }
+  }
+
+  private boolean runWithOutputListener(
+      String testClassName, Path xmlOut, AtomicReference<Throwable> uncaughtOnOtherThread) {
     try (BazelJUnitOutputListener bazelJUnitXml = new BazelJUnitOutputListener(xmlOut)) {
       Runtime.getRuntime()
           .addShutdownHook(
@@ -126,6 +153,21 @@ public class ActualRunner implements RunsTest {
         summary.writeTo(writer);
       }
 
+      Throwable uncaught = uncaughtOnOtherThread.get();
+      if (uncaught != null) {
+        System.err.printf(
+            "WARNING: %s: an exception escaped uncaught on another thread (%s). This was not"
+                + " reflected in any individual test result, since the test engine was never"
+                + " told about it:%n",
+            testClassName, uncaught.getClass().getName());
+        uncaught.printStackTrace(System.err);
+        boolean failOnUncaughtEnabled =
+            Boolean.parseBoolean(System.getenv("JUNIT5_FAIL_ON_UNCAUGHT_EXCEPTIONS"));
+        if (shouldFailForUncaughtException(uncaught, failOnUncaughtEnabled)) {
+          return false;
+        }
+      }
+
       boolean failIfNoTestsEnabled = Boolean.parseBoolean(System.getenv("JUNIT5_FAIL_IF_NO_TESTS"));
       if (shouldFailForNoTests(summary, failIfNoTestsEnabled)) {
         System.err.printf(
@@ -149,6 +191,16 @@ public class ActualRunner implements RunsTest {
     return summary.getFailureCount() == 0
         && summary.getTestCount() == 0
         && failIfNoTestsEnabled;
+  }
+
+  /**
+   * Opt-in (disabled by default, same non-breaking rationale as {@link #shouldFailForNoTests}):
+   * whether an exception that escaped uncaught on a thread the test never joined/awaited should
+   * fail the test, even though the test engine itself has no idea anything went wrong.
+   */
+  static boolean shouldFailForUncaughtException(
+      Throwable uncaughtOnOtherThread, boolean failOnUncaughtEnabled) {
+    return uncaughtOnOtherThread != null && failOnUncaughtEnabled;
   }
 
   /**
